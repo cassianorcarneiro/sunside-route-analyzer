@@ -1,26 +1,29 @@
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
+# SUNSIDE ROUTE ANALYZER
+# REPOSITORY: https://github.com/cassianorcarneiro/sunside-route-analyzer
+# CASSIANO RIBEIRO CARNEIRO
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
+
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Tuple, Union
-
 import numpy as np
 import pandas as pd
-
 import folium
 import geopandas as gpd
 import networkx as nx
 import osmnx as ox
 import pvlib
+
 from pyproj import Geod
 from shapely.geometry import LineString, Point
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
-
-# ---------- Types / Globals ----------
+# Types / Globals
 
 LatLon = Tuple[float, float]
 WGS84 = Geod(ellps="WGS84")
-
 
 @dataclass
 class SegmentResult:
@@ -41,13 +44,11 @@ class SegmentResult:
     I_right: float
     side_less_sun: str  # "left" | "right" | "none"
 
-
-# ---------- Geometry / Solar helpers ----------
+# Geometry / Solar helpers
 
 def bearing_deg_wgs84(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     fwd_az, _, _ = WGS84.inv(lon1, lat1, lon2, lat2)
     return float((fwd_az + 360.0) % 360.0)  # 0=N, 90=E
-
 
 def sun_horizontal_vector_EN(az_deg: float, el_deg: float) -> np.ndarray:
     """Horizontal projection of sun direction in local East-North plane."""
@@ -57,7 +58,6 @@ def sun_horizontal_vector_EN(az_deg: float, el_deg: float) -> np.ndarray:
     el = np.deg2rad(el_deg)
     c = np.cos(el)
     return np.array([c * np.sin(az), c * np.cos(az)], dtype=float)  # [E, N]
-
 
 def build_route_linestring_projected(gdf_edges: gpd.GeoDataFrame) -> LineString:
     """Concatenate edge geometries (projected CRS) into a single LineString."""
@@ -83,10 +83,7 @@ def build_route_linestring_projected(gdf_edges: gpd.GeoDataFrame) -> LineString:
 
     return LineString(coords)
 
-
-def sample_linestring_by_step_m(
-    ls_proj: LineString, step_m: float
-) -> Tuple[List[Point], np.ndarray, float]:
+def sample_linestring_by_step_m(ls_proj: LineString, step_m: float) -> Tuple[List[Point], np.ndarray, float]:
     """
     Sample a projected LineString (meters) at fixed spacing.
     Returns: (points_proj, cumulative_distances_m, total_m)
@@ -106,18 +103,12 @@ def sample_linestring_by_step_m(
     pts = [ls_proj.interpolate(d) for d in dists]
     return pts, dists, total
 
+# OSM / Routing helpers
 
-# ---------- OSM / Routing helpers ----------
+def graph_from_waypoint_corridor(waypoints_latlon: List[LatLon],
+                                 buffer_m: float = 8000.0,
+                                 network_type: str = "drive",) -> nx.MultiDiGraph:
 
-def graph_from_waypoint_corridor(
-    waypoints_latlon: List[LatLon],
-    buffer_m: float = 8000.0,
-    network_type: str = "drive",
-) -> nx.MultiDiGraph:
-    """
-    Build a graph only inside a corridor around the polyline formed by waypoints.
-    This strongly reduces unwanted alternative routes and Overpass query size.
-    """
     if len(waypoints_latlon) < 2:
         raise ValueError("Need at least origin and destination in waypoints_latlon.")
 
@@ -131,16 +122,12 @@ def graph_from_waypoint_corridor(
     )
     return ox.graph_from_polygon(corridor, network_type=network_type)
 
-
-def save_route_map_html(
-    gdf_edges: gpd.GeoDataFrame,
-    origin_latlon: LatLon,
-    dest_latlon: LatLon,
-    vias_latlon: Optional[List[LatLon]] = None,
-    out_html: str = "route.html",
-    zoom_start: int = 9,
-) -> str:
-    """Save an interactive HTML map of the computed route."""
+def save_route_map_html(gdf_edges: gpd.GeoDataFrame,origin_latlon: LatLon,
+                        dest_latlon: LatLon,
+                        vias_latlon: Optional[List[LatLon]] = None,
+                        out_html: str = "route.html",
+                        zoom_start: int = 9) -> str:
+    
     edges_ll = (
         gdf_edges.to_crs("EPSG:4326")
         if gdf_edges.crs and gdf_edges.crs.to_string() != "EPSG:4326"
@@ -165,41 +152,23 @@ def save_route_map_html(
     m.save(out_html)
     return out_html
 
+# Main algorithm
 
-# ---------- Main algorithm ----------
+def best_side_less_sun(origin_latlon: LatLon,
+                       dest_latlon: LatLon,
+                       depart_time: Union[str, pd.Timestamp],
+                       arrive_time: Union[str, pd.Timestamp],
+                       tz: str = "America/Sao_Paulo",
+                       step_m: float = 500.0,
+                       network_type: str = "drive",
+                       via_latlon: Optional[List[LatLon]] = None,
+                       corridor_buffer_m: float = 8000.0,
+                       weight: str = "travel_time",
+                       save_html_map: bool = True,
+                       html_path: str = "route.html") -> Tuple[pd.DataFrame, Dict[str, Union[float, int, str]]]:
 
-def best_side_less_sun(
-    origin_latlon: LatLon,
-    dest_latlon: LatLon,
-    depart_time: Union[str, pd.Timestamp],
-    arrive_time: Union[str, pd.Timestamp],
-    tz: str = "America/Sao_Paulo",
-    step_m: float = 500.0,
-    network_type: str = "drive",
-    via_latlon: Optional[List[LatLon]] = None,
-    corridor_buffer_m: float = 8000.0,
-    weight: str = "travel_time",
-    save_html_map: bool = True,
-    html_path: str = "route.html",
-) -> Tuple[pd.DataFrame, Dict[str, Union[float, int, str]]]:
-    """
-    Segment-by-segment estimate of which vehicle side receives LESS direct sun.
+    # time handling
 
-    Routing:
-      - Graph is built using a corridor around [origin, vias..., destination].
-      - Route is computed on that graph from origin to destination.
-      - If vias are provided, they are used to define the corridor (to bias against alternatives).
-        (This avoids "route + spurs" behavior more reliably than hard via constraints.)
-
-    Solar model:
-      - pvlib solar position at each segment time and location
-      - compare lateral components: dot(sun_horizontal, side_normal)
-
-    Returns:
-      - df: per-segment results
-      - summary: aggregated stats
-    """
-    # --- time handling ---
     depart_time = pd.Timestamp(depart_time)
     arrive_time = pd.Timestamp(arrive_time)
 
@@ -216,11 +185,13 @@ def best_side_less_sun(
     if arrive_time <= depart_time:
         raise ValueError("arrive_time must be later than depart_time")
 
-    # --- settings / caching ---
+    # settings / caching
+
     ox.settings.use_cache = True
     ox.settings.log_console = False
 
-    # --- build corridor graph ---
+    # build corridor graph
+
     waypoints = [origin_latlon] + (via_latlon or []) + [dest_latlon]
     G = graph_from_waypoint_corridor(
         waypoints_latlon=waypoints,
@@ -233,11 +204,13 @@ def best_side_less_sun(
     G = ox.add_edge_travel_times(G)
 
     # projected CRS
+
     nodes_gdf = ox.graph_to_gdfs(G, nodes=True, edges=False)
     gdf_nodes = nodes_gdf[0] if isinstance(nodes_gdf, tuple) else nodes_gdf
     crs_proj = gdf_nodes.crs
 
     # snap origin/destination
+
     (olat, olon) = origin_latlon
     (dlat, dlon) = dest_latlon
     p_orig = gpd.GeoSeries([Point(olon, olat)], crs="EPSG:4326").to_crs(crs_proj).iloc[0]
@@ -247,6 +220,7 @@ def best_side_less_sun(
     n_dest = ox.nearest_nodes(G, X=p_dest.x, Y=p_dest.y)
 
     # route
+
     route = nx.shortest_path(G, n_orig, n_dest, weight=weight)
     gdf_edges = ox.routing.route_to_gdf(G, route)
 
@@ -254,10 +228,12 @@ def best_side_less_sun(
         save_route_map_html(gdf_edges, origin_latlon, dest_latlon, via_latlon, out_html=html_path)
 
     # build a single route linestring and sample (meters)
+
     route_ls_proj = build_route_linestring_projected(gdf_edges)
     pts_proj, cum_m, total_m = sample_linestring_by_step_m(route_ls_proj, float(step_m))
 
     # lat/lon for solar position
+
     pts_ll = gpd.GeoSeries(pts_proj, crs=crs_proj).to_crs("EPSG:4326")
 
     total_dt_s = (arrive_time - depart_time).total_seconds()
@@ -273,6 +249,7 @@ def best_side_less_sun(
         t = depart_time + pd.to_timedelta(frac * total_dt_s, unit="s")
 
         # direction in projected CRS (treat as local EN for our purposes)
+
         dx = float(p2.x - p1.x)
         dy = float(p2.y - p1.y)
         norm = (dx * dx + dy * dy) ** 0.5
@@ -281,6 +258,7 @@ def best_side_less_sun(
         dE, dN = dx / norm, dy / norm
 
         # side normals
+
         nL = np.array([-dN, dE], dtype=float)
         nR = np.array([dN, -dE], dtype=float)
 
@@ -304,6 +282,7 @@ def best_side_less_sun(
             side = "left" if effL < effR else "right"
 
         # bearing for reporting (WGS84)
+
         if i + 1 < len(pts_ll):
             lat2 = float(pts_ll.iloc[i + 1].y)
             lon2 = float(pts_ll.iloc[i + 1].x)
@@ -375,8 +354,7 @@ def best_side_less_sun(
 
     return df, summary
 
-
-# ---------- Example / CLI ----------
+# CLI
 
 def main() -> None:
     
@@ -388,17 +366,15 @@ def main() -> None:
         (-21.729457992953115, -43.066059553474155),
     ]
 
-    df, summary = best_side_less_sun(
-        origin_latlon=origin,
-        dest_latlon=destination,
-        via_latlon=vias,
-        depart_time="2026-02-14 14:00",
-        arrive_time="2026-02-14 17:00",
-        step_m=500.0,
-        corridor_buffer_m=8000.0,
-        save_html_map=True,
-        html_path="route.html",
-    )
+    df, summary = best_side_less_sun(origin_latlon=origin,
+                                     dest_latlon=destination,
+                                     via_latlon=vias,
+                                     depart_time="2026-02-14 14:00",
+                                     arrive_time="2026-02-14 17:00",
+                                     step_m=500.0,
+                                     corridor_buffer_m=8000.0,
+                                     save_html_map=True,
+                                     html_path="route.html")
 
     print()
     print(summary)
