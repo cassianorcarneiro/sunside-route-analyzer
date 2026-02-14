@@ -87,6 +87,8 @@ class SunSideRouteAnalyzer:
                 html_path: str = "route.html",
                 zoom_start: int = 9) -> Tuple[pd.DataFrame, Dict[str, Union[float, int, str]]]:
         
+        self._validate_inputs(origin_latlon, dest_latlon, depart_time, arrive_time)
+
         depart_time, arrive_time = self._normalize_times(depart_time, arrive_time)
 
         waypoints = [origin_latlon] + (via_latlon or []) + [dest_latlon]
@@ -205,11 +207,10 @@ class SunSideRouteAnalyzer:
 
     # Internal helpers
 
-    def _normalize_times(
-        self,
-        depart_time: Union[str, pd.Timestamp],
-        arrive_time: Union[str, pd.Timestamp],
-    ) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    def _normalize_times(self,
+                         depart_time: Union[str, pd.Timestamp],
+                         arrive_time: Union[str, pd.Timestamp]) -> Tuple[pd.Timestamp, pd.Timestamp]:
+        
         depart = pd.Timestamp(depart_time)
         arrive = pd.Timestamp(arrive_time)
 
@@ -431,6 +432,52 @@ class SunSideRouteAnalyzer:
             "overall_best_side": overall,
             "route_map_html": html_path if save_html_map else "",
         }
+    
+    def _validate_inputs(
+        self,
+        origin: Optional[LatLon],
+        destination: Optional[LatLon],
+        depart_time: Union[str, pd.Timestamp, None],
+        arrive_time: Union[str, pd.Timestamp, None],
+    ) -> None:
+        # Presence
+        if origin is None or destination is None:
+            raise ValueError("Origin and destination must be provided.")
+
+        if not isinstance(origin, tuple) or not isinstance(destination, tuple) or len(origin) != 2 or len(destination) != 2:
+            raise ValueError("Origin and destination must be (lat, lon) tuples.")
+
+        # Coordinate range validation
+        def _check_coord(name: str, coord: LatLon) -> None:
+            lat, lon = coord
+            if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+                raise ValueError(f"{name} must contain numeric (lat, lon).")
+            if not (-90.0 <= float(lat) <= 90.0 and -180.0 <= float(lon) <= 180.0):
+                raise ValueError(f"{name} is out of range: {coord}")
+
+        _check_coord("origin", origin)
+        _check_coord("destination", destination)
+
+        # Time validation
+        if depart_time is None or arrive_time is None:
+            raise ValueError("Departure and arrival times must be provided.")
+
+        try:
+            depart = pd.Timestamp(depart_time)
+            arrive = pd.Timestamp(arrive_time)
+        except Exception as e:
+            raise ValueError("Invalid datetime format for depart_time or arrive_time.") from e
+
+        if arrive <= depart:
+            raise ValueError("Arrival time must be later than departure time.")
+
+        # Municipality validation (best-effort; requires network)
+        origin_city = self.municipality_from_geopy(origin)
+        dest_city = self.municipality_from_geopy(destination)
+
+        if origin_city is not None and dest_city is not None:
+            if origin_city.strip().casefold() == dest_city.strip().casefold():
+                raise ValueError(f"Origin and destination municipalities are the same: '{origin_city}'.")
 
 # CLI
 
@@ -441,14 +488,14 @@ def main() -> None:
     origin: LatLon = (-21.363765592156483, -42.479130078913386)
     destination: LatLon = (-21.76499940229693, -43.34904075036292)
 
-    depart_time = "2026-02-14 14:00"
-    arrive_time = "2026-02-14 17:00"
+    depart_time = "2026-02-14 14:00-03:00"
+    arrive_time = "2026-02-14 17:00-03:00"
 
     vias: List[LatLon] = [
         (-21.529919919177065, -42.64351463191004),
         (-21.729457992953115, -43.066059553474155),
     ]
-
+    
     analyzer = SunSideRouteAnalyzer(tz="America/Sao_Paulo",
                                     network_type="drive",
                                     weight="travel_time",
@@ -470,7 +517,7 @@ def main() -> None:
 
     print(f"From {origin_city} to {dest_city} at {depart_time}")
     print()
-    print(f"Overall best side: {summary['overall_best_side']}")
+    print(f"Overall best side: {summary['overall_best_side'] if summary['overall_best_side'] != 'none' else 'No significant sunlight'}")
     print()
     print(f"Route map saved to: {summary['route_map_html']}")
 
