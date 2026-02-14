@@ -1,0 +1,16 @@
+# Core scientific stack
+numpy>=1.24
+pandas>=2.0
+
+# Geospatial stack
+osmnx>=2.0
+networkx>=3.0
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.6
+
+# Solar position
+pvlib>=0.10
+
+# Visualization
+folium>=0.15
