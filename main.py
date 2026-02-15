@@ -483,18 +483,15 @@ class SunSideRouteAnalyzer:
 
 def main() -> None:
 
-    print(f'Find geographic coordinates at: https://www.google.com/maps/\n')
+    depart_time = ""            # Example: 2026-02-15 14:30-03:00
+    arrive_time = ""            # Example: 2026-02-15 17:00-03:00
 
-    origin: LatLon = (-21.363765592156483, -42.479130078913386)
-    destination: LatLon = (-21.76499940229693, -43.34904075036292)
+    origin: LatLon = ()         # Example: (-21.363765592156483, -42.479130078913386)
+    destination: LatLon = ()    # Example: (-21.76499940229693, -43.34904075036292)
+    
+    # Some intermediate points to define a unique path
 
-    depart_time = "2026-02-14 14:00-03:00"
-    arrive_time = "2026-02-14 17:00-03:00"
-
-    vias: List[LatLon] = [
-        (-21.529919919177065, -42.64351463191004),
-        (-21.729457992953115, -43.066059553474155),
-    ]
+    vias: List[LatLon] = []     # Example: [(-21.529919919177065, -42.64351463191004), (-21.729457992953115, -43.066059553474155)] 
     
     analyzer = SunSideRouteAnalyzer(tz="America/Sao_Paulo",
                                     network_type="drive",
@@ -502,15 +499,13 @@ def main() -> None:
                                     corridor_buffer_m=8000.0,
                                     step_m=500.0)
     
-    df, summary = analyzer.analyze(
-        origin_latlon=origin,
-        dest_latlon=destination,
-        via_latlon=vias,
-        depart_time=depart_time,
-        arrive_time=arrive_time,
-        save_html_map=True,
-        html_path="route.html",
-    )
+    df, summary = analyzer.analyze(origin_latlon=origin,
+                                   dest_latlon=destination,
+                                   via_latlon=vias,
+                                   depart_time=depart_time,
+                                   arrive_time=arrive_time,
+                                   save_html_map=True,
+                                   html_path="route.html")
 
     origin_city = analyzer.municipality_from_geopy(origin)
     dest_city = analyzer.municipality_from_geopy(destination)
@@ -522,7 +517,9 @@ def main() -> None:
     print(f"Route map saved to: {summary['route_map_html']}")
 
     # Debug (optional)
-    # print(df.head())
+
+    if False:
+        print(df.head())
 
 if __name__ == "__main__":
     os.system("cls" if os.name == "nt" else "clear")
