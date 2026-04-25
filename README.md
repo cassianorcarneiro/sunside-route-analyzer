@@ -231,5 +231,9 @@ sunside-route-analyzer/
 - [ ] Pip-installable package
 
 ---
+### 📝 AI Assistance Disclosure
+The codebase architecture, organizational structure, and stylistic formatting of this repository were refactored and optimized leveraging [Claude](https://www.anthropic.com/claude) by Anthropic. All core business logic and intellectual property remain the work of the repository authors and are governed by the project's license.
+
+---
 
 > *Built for road-trippers, motion-sickness sufferers, and anyone who's ever squinted into a setting sun for three hours straight.*
