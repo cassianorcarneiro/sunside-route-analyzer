@@ -1,19 +1,25 @@
-# SunSide Route Analyzer
+# ☀️ SunSide Route Analyzer
 
-> Estimate which side of your vehicle receives **less direct sunlight** along a driving route, segment by segment.
+> Estimate which side of your vehicle receives less direct sunlight along a driving route, segment by segment.
 
 A Python tool that combines OpenStreetMap routing with solar position calculations to recommend the shadier side of the car for any trip — useful for long highway drives where sun glare and heat make a real difference in comfort.
 
+<p align="center">
+  <img alt="Stack" src="https://img.shields.io/badge/Stack-OSMnx%20%2B%20pvlib-blue?style=for-the-badge">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge">
+  <img alt="Status" src="https://img.shields.io/badge/Status-Stable-success?style=for-the-badge">
+</p>
+
 ---
 
-## ☀️ How it works
+## 📦 How it works
 
 The analyzer breaks your route into ~500 m segments and, for each one, computes:
 
-1. The **vehicle's heading** at that point (from the road geometry).
-2. The **sun's azimuth and elevation** at that point and time (via [`pvlib`](https://pvlib-python.readthedocs.io)).
-3. The **signed projection** of the sun vector onto each side of the car.
-4. A **per-segment recommendation**: `left`, `right`, or `none` (sun behind / below horizon).
+1. The **vehicle's heading** at that point (from the road geometry)
+2. The **sun's azimuth and elevation** at that point and time (via [`pvlib`](https://pvlib-python.readthedocs.io))
+3. The **signed projection** of the sun vector onto each side of the car
+4. A **per-segment recommendation**: `left`, `right`, or `none` (sun behind / below horizon)
 
 Then it aggregates all segments — weighted by distance — into one overall recommendation for the whole trip.
 
@@ -46,15 +52,23 @@ The route is computed inside a **buffered corridor** around your origin → vias
 
 ---
 
-## 📦 Installation
+## 📋 Prerequisites
 
-Requires **Python 3.10+**.
+- **Python 3.10+**
+- A few hundred MB of disk space for OSMnx tile cache (grows with use)
+- Internet on first run for OSM data downloads
+
+---
+
+## 🚀 Quick start
+
+### Install
 
 ```bash
 pip install osmnx networkx pvlib geopandas shapely pyproj folium geopy pandas numpy
 ```
 
-Or using `requirements.txt`:
+Or via `requirements.txt`:
 
 ```bash
 pip install -r requirements.txt
@@ -62,11 +76,7 @@ pip install -r requirements.txt
 
 > **Note:** OSMnx pulls in `geopandas`, `shapely`, `pyproj`, and `networkx` automatically, but listing them explicitly avoids version surprises.
 
----
-
-## 🚀 Usage
-
-### Command-line interface
+### Command-line usage
 
 Minimal example — a daytime drive from Bicas (MG) to Juiz de Fora (MG):
 
@@ -93,26 +103,6 @@ python sunside_route_analyzer.py \
     -v
 ```
 
-### CLI options
-
-| Flag | Description |
-|------|-------------|
-| `--origin LAT,LON` | Origin coordinate (required) |
-| `--destination LAT,LON` | Destination coordinate (required) |
-| `--depart TIME` | Departure timestamp, ISO 8601 (required) |
-| `--arrive TIME` | Arrival timestamp, ISO 8601 (required) |
-| `--via LAT,LON` | Intermediate waypoint (repeat for multiple) |
-| `--tz ZONE` | Timezone for naive timestamps (default: `America/Sao_Paulo`) |
-| `--corridor-buffer-m N` | Corridor width in meters (default: 8000) |
-| `--step-m N` | Sampling step in meters (default: 500) |
-| `--weight {travel_time,length}` | Edge weight for shortest path (default: `travel_time`) |
-| `--html-out PATH` | Output HTML map path (default: `route.html`) |
-| `--csv-out PATH` | Optional CSV export of all segments |
-| `--no-map` | Skip rendering the HTML map |
-| `--show-head` | Print first rows of the segments DataFrame |
-| `--lookup-cities` | Reverse-geocode origin/destination names (network) |
-| `-v`, `-vv` | Increase logging verbosity |
-
 ### Programmatic usage
 
 ```python
@@ -137,6 +127,28 @@ df, summary = analyzer.analyze(
 print(f"Recommended side: {summary['overall_best_side']}")
 print(df.head())
 ```
+
+---
+
+## ⚙️ CLI options
+
+| Flag | Description |
+|------|-------------|
+| `--origin LAT,LON` | Origin coordinate (required) |
+| `--destination LAT,LON` | Destination coordinate (required) |
+| `--depart TIME` | Departure timestamp, ISO 8601 (required) |
+| `--arrive TIME` | Arrival timestamp, ISO 8601 (required) |
+| `--via LAT,LON` | Intermediate waypoint (repeat for multiple) |
+| `--tz ZONE` | Timezone for naive timestamps (default: `America/Sao_Paulo`) |
+| `--corridor-buffer-m N` | Corridor width in meters (default: 8000) |
+| `--step-m N` | Sampling step in meters (default: 500) |
+| `--weight {travel_time,length}` | Edge weight for shortest path (default: `travel_time`) |
+| `--html-out PATH` | Output HTML map path (default: `route.html`) |
+| `--csv-out PATH` | Optional CSV export of all segments |
+| `--no-map` | Skip rendering the HTML map |
+| `--show-head` | Print first rows of the segments DataFrame |
+| `--lookup-cities` | Reverse-geocode origin/destination names (network) |
+| `-v`, `-vv` | Increase logging verbosity |
 
 ---
 
@@ -211,7 +223,7 @@ When the sun is below the horizon, the vector is zero and the segment is reporte
 
 ---
 
-## 📁 Project layout
+## 📁 Project structure
 
 ```
 sunside-route-analyzer/
@@ -231,7 +243,19 @@ sunside-route-analyzer/
 - [ ] Pip-installable package
 
 ---
-### 📝 AI Assistance Disclosure
+
+## 📜 License
+
+MIT — see `LICENSE` file.
+
+## 👤 Author
+
+**Cassiano Ribeiro Carneiro** — [@cassianorcarneiro](https://github.com/cassianorcarneiro)
+
+---
+
+### 🤖 AI Assistance Disclosure
+
 The codebase architecture, organizational structure, and stylistic formatting of this repository were refactored and optimized leveraging [Claude](https://www.anthropic.com/claude) by Anthropic. All core business logic and intellectual property remain the work of the repository authors and are governed by the project's license.
 
 ---
