@@ -1,4 +1,9 @@
-# run_example.py — quick-start example. Open and press F5 in VS Code.
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
+# SUNSIDE ROUTE ANALYZER
+# REPOSITORY: https://github.com/cassianorcarneiro/sunside-route-analyzer
+# Example
+# CASSIANO RIBEIRO CARNEIRO
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
 
 from sunside_route_analyzer import SunSideRouteAnalyzer, LatLon
 
