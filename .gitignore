@@ -54,3 +54,7 @@ route.html
 
 # Cache (OSMnx)
 cache/
+
+# Generated files
+route.html
+segments.csv
