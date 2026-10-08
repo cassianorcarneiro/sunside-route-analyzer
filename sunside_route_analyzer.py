@@ -6,17 +6,25 @@
 
 """Estimate which side of a vehicle receives less direct sunlight along a driving route.
 
-Combines OpenStreetMap routing (via OSMnx) with solar position calculations (via pvlib)
-to produce a per-segment recommendation of the shadier side of the car.
+Pipeline:
+    1. Resolve places (city names via Nominatim, or raw lat/lon).
+    2. Download the drivable OSM graph inside a corridor around the waypoints.
+    3. Route leg by leg (origin -> via_1 -> ... -> destination).
+    4. Split the route into its native OSM polyline segments (no resampling).
+    5. Assign each segment a time from OSM edge travel times, rescaled to the user's arrival time.
+    6. Compute solar position and clear-sky DNI per segment (vectorized pvlib).
+    7. Integrate direct-beam radiant exposure on each vertical side window over time.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import os
+import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -27,15 +35,11 @@ import numpy as np
 import osmnx as ox
 import pandas as pd
 import pvlib
+from geopy.exc import GeopyError
 from geopy.extra.rate_limiter import RateLimiter
 from geopy.geocoders import Nominatim
 from pyproj import Geod
-from shapely.geometry import LineString, Point
-
-
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
-# Logging
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
+from shapely.geometry import LineString
 
 logger = logging.getLogger("sunside_route_analyzer")
 
@@ -45,46 +49,39 @@ logger = logging.getLogger("sunside_route_analyzer")
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
 
 class LatLon(NamedTuple):
-    """A geographic coordinate in WGS84 (latitude, longitude) in decimal degrees."""
+    """A WGS84 coordinate in decimal degrees."""
 
     lat: float
     lon: float
 
 
-# Type aliases for clarity at call sites
 LatLonLike = tuple[float, float] | LatLon
+Place = str | LatLonLike          # "Juiz de Fora, MG, Brasil", "-21.76,-43.35" or (lat, lon)
 TimeLike = str | pd.Timestamp
+
+_LATLON_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
 @dataclass(frozen=True)
-class SegmentResult:
-    """Per-segment output for a single sampled stretch of the route.
+class ResolvedPlace:
+    """A place after geocoding: the coordinate used for routing plus a human-readable label."""
 
-    Attributes:
-        index:               Sequential index of the segment along the route.
-        time:                Timestamp at which the vehicle is estimated to be at this segment.
-        lat, lon:            Coordinates of the segment start in WGS84.
-        segment_m:           Length of this segment in meters.
-        cum_m:               Cumulative distance from the route origin in meters.
-        road_bearing_deg:    Direction of travel (0=N, 90=E) in degrees.
-        sun_azimuth_deg:     Solar azimuth at this point and time.
-        sun_elevation_deg:   Solar elevation at this point and time.
-        I_left, I_right:     Signed projection of the sun vector on each side normal.
-        side_less_sun:       Which vehicle side receives less direct sunlight: "left", "right" or "none".
-    """
+    query: str
+    label: str
+    coord: LatLon
 
-    index: int
-    time: pd.Timestamp
-    lat: float
-    lon: float
-    segment_m: float
-    cum_m: float
-    road_bearing_deg: float
-    sun_azimuth_deg: float
-    sun_elevation_deg: float
-    I_left: float
-    I_right: float
-    side_less_sun: str
+
+@dataclass(frozen=True)
+class _Polyline:
+    """Route as arrays of native OSM segments (one entry per consecutive vertex pair)."""
+
+    lon1: np.ndarray
+    lat1: np.ndarray
+    lon2: np.ndarray
+    lat2: np.ndarray
+    length_m: np.ndarray
+    heading_deg: np.ndarray
+    duration_s: np.ndarray
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
@@ -92,15 +89,27 @@ class SegmentResult:
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
 
 class SunSideRouteAnalyzer:
-    """Segment-by-segment estimate of which side of a vehicle receives LESS direct sunlight
-    along a driving route, using OpenStreetMap routing (OSMnx) + pvlib solar position.
+    """Integrates direct-beam solar exposure on each side window of a vehicle along an OSM route.
 
-    Routing uses a corridor around [origin, vias..., destination] to reduce unwanted alternatives.
+    Physical model:
+        Each side window is a vertical plane whose outward normal is perpendicular to the heading.
+        cos(incidence) on the left window = cos(el) * sin(heading - azimuth).
+        Exposure [Wh/m^2] = sum over segments of DNI * max(0, cos(incidence)) * dt / 3600.
+        The right window has the opposite sign.
     """
 
-    # Class-level constants
-    _MIN_ENDPOINT_DISTANCE_M = 1000.0          # origin and destination must be at least this far apart
-    _MAX_SAMPLE_POINTS = 2_000_000             # safety cap to prevent runaway sampling
+    _MIN_ENDPOINT_DISTANCE_M = 1000.0
+    _SNAP_WARN_DISTANCE_M = 2000.0
+    _TIMING_SCALE_WARN = (0.6, 1.8)
+    # Free-flow speeds for untagged edges (km/h). maxspeed coverage is sparse in much of Brazil.
+    _HWY_SPEEDS_KPH = {
+        "motorway": 100, "motorway_link": 60, "trunk": 90, "trunk_link": 50,
+        "primary": 80, "primary_link": 40, "secondary": 60, "secondary_link": 40,
+        "tertiary": 50, "tertiary_link": 30, "unclassified": 40, "residential": 30,
+        "living_street": 10, "service": 20,
+    }
+    _FALLBACK_SPEED_KPH = 40.0
+    _SETTLEMENT_TYPES = frozenset({"city", "town", "village", "municipality", "hamlet"})
     _DEFAULT_GEOCODER_ZOOM_LEVELS = (10, 12, 8)
     _MUNICIPAL_KEYS = (
         "city", "town", "village", "municipality",
@@ -114,157 +123,145 @@ class SunSideRouteAnalyzer:
         network_type: str = "drive",
         weight: str = "travel_time",
         corridor_buffer_m: float = 8000.0,
-        step_m: float = 500.0,
+        weighting: str = "clearsky",
+        balance_threshold: float = 0.15,
         use_osmnx_cache: bool = True,
         log_console: bool = False,
-        geopy_user_agent: str = "sun-side-route-analyzer",
-        geopy_min_delay_s: float = 1.1,
+        geocoder_user_agent: str = "sunside-route-analyzer",
+        geocoder_language: str = "pt-BR",
+        geocoder_min_delay_s: float = 1.1,
     ) -> None:
+        """
+        Args:
+            tz:                 IANA timezone used to localize naive timestamps.
+            network_type:       OSMnx network type.
+            weight:             Edge attribute minimized by the router ("travel_time" or "length").
+            corridor_buffer_m:  Buffer distance on EACH side of the waypoint polyline.
+            weighting:          "clearsky" weights incidence by Ineichen clear-sky DNI (W/m^2).
+                                "geometric" uses DNI = 1 (pure geometry, unitless).
+            balance_threshold:  |balance| below this returns "either" instead of a side.
+        """
         if corridor_buffer_m <= 0:
             raise ValueError("corridor_buffer_m must be positive.")
-        if step_m <= 0:
-            raise ValueError("step_m must be positive.")
+        if weighting not in ("clearsky", "geometric"):
+            raise ValueError("weighting must be 'clearsky' or 'geometric'.")
+        if not 0.0 <= balance_threshold < 1.0:
+            raise ValueError("balance_threshold must be in [0, 1).")
 
         self.tz = tz
         self.network_type = network_type
         self.weight = weight
         self.corridor_buffer_m = float(corridor_buffer_m)
-        self.step_m = float(step_m)
+        self.weighting = weighting
+        self.balance_threshold = float(balance_threshold)
+        self.geod = Geod(ellps="WGS84")
 
-        self.wgs84 = Geod(ellps="WGS84")
-
-        # OSMnx settings (module-level, applied once per process)
         ox.settings.use_cache = bool(use_osmnx_cache)
         ox.settings.log_console = bool(log_console)
 
-        # Geocoding (lazy: only used when explicitly called)
-        self._geolocator = Nominatim(user_agent=geopy_user_agent, timeout=10)
-        self._reverse = RateLimiter(self._geolocator.reverse, min_delay_seconds=geopy_min_delay_s)
+        self.geocoder_language = geocoder_language
+        self._geolocator = Nominatim(user_agent=geocoder_user_agent, timeout=10)
+        self._geocode = RateLimiter(self._geolocator.geocode, min_delay_seconds=geocoder_min_delay_s)
+        self._reverse = RateLimiter(self._geolocator.reverse, min_delay_seconds=geocoder_min_delay_s)
+        self._geocode_cache: dict[str, ResolvedPlace] = {}
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
+    def resolve_place(self, place: Place, name: str = "place") -> ResolvedPlace:
+        """Turn a city name, a 'lat,lon' string or a (lat, lon) pair into a ResolvedPlace.
+
+        Names are geocoded with Nominatim. Settlement results (city/town/village) are
+        preferred over streets or POIs with the same name.
+        """
+        if isinstance(place, str):
+            m = _LATLON_RE.match(place)
+            if m:
+                coord = self._coerce_latlon((float(m.group(1)), float(m.group(2))), name)
+                return ResolvedPlace(place, f"{coord.lat:.5f},{coord.lon:.5f}", coord)
+            return self._geocode_name(place, name)
+
+        coord = self._coerce_latlon(place, name)
+        return ResolvedPlace(str(tuple(coord)), f"{coord.lat:.5f},{coord.lon:.5f}", coord)
+
     def analyze(
         self,
-        origin_latlon: LatLonLike,
-        dest_latlon: LatLonLike,
+        origin: Place,
+        destination: Place,
         depart_time: TimeLike,
-        arrive_time: TimeLike,
-        via_latlon: list[LatLonLike] | None = None,
+        arrive_time: TimeLike | None = None,
+        vias: list[Place] | None = None,
         save_html_map: bool = True,
         html_path: str | Path = "route.html",
         zoom_start: int = 9,
-    ) -> tuple[pd.DataFrame, dict[str, float | int | str]]:
-        """Run the full analysis pipeline.
+    ) -> tuple[pd.DataFrame, dict[str, object]]:
+        """Run the full pipeline.
 
         Args:
-            origin_latlon:   Origin coordinate (lat, lon) in WGS84.
-            dest_latlon:     Destination coordinate (lat, lon) in WGS84.
-            depart_time:     Departure time (string or pandas Timestamp).
-            arrive_time:     Arrival time (string or pandas Timestamp).
-            via_latlon:      Optional intermediate waypoints to constrain the corridor.
-            save_html_map:   If True, save an interactive HTML map of the route.
-            html_path:       Output path for the HTML map.
-            zoom_start:      Initial zoom level of the saved map.
+            origin, destination: City name ("Bicas, MG, Brasil"), "lat,lon" string or (lat, lon).
+            depart_time:         Departure time.
+            arrive_time:         Optional arrival time. If omitted, OSM travel times are used as-is.
+                                 If given, OSM travel times are rescaled uniformly to match it.
+            vias:                Intermediate waypoints. The route passes through each one in order.
 
         Returns:
             (segments_dataframe, summary_dict)
         """
-        origin = self._coerce_latlon(origin_latlon, "origin")
-        destination = self._coerce_latlon(dest_latlon, "destination")
-        vias = [self._coerce_latlon(v, f"via[{i}]") for i, v in enumerate(via_latlon or [])]
+        places = [self.resolve_place(origin, "origin")]
+        places += [self.resolve_place(v, f"via[{i}]") for i, v in enumerate(vias or [])]
+        places.append(self.resolve_place(destination, "destination"))
+        waypoints = [p.coord for p in places]
+        for p in places:
+            logger.info("Resolved %r -> %s (%.5f, %.5f)", p.query, p.label, p.coord.lat, p.coord.lon)
 
-        self._validate_inputs(origin, destination, depart_time, arrive_time)
+        self._check_endpoint_distance(waypoints[0], waypoints[-1])
         depart, arrive = self._normalize_times(depart_time, arrive_time)
-        html_path = str(html_path)
 
-        logger.info("Building corridor graph (buffer=%.0f m)...", self.corridor_buffer_m)
-        waypoints = [origin, *vias, destination]
+        logger.info("Downloading corridor graph (buffer=%.0f m per side)...", self.corridor_buffer_m)
         G = self._build_corridor_graph(waypoints)
-
-        logger.info("Projecting graph and computing edge speeds/travel times...")
-        G = ox.project_graph(G)
-        G = ox.add_edge_speeds(G)
+        # Only edges WITHOUT a maxspeed tag use hwy_speeds; tagged edges keep their own value.
+        G = ox.add_edge_speeds(G, hwy_speeds=self._HWY_SPEEDS_KPH, fallback=self._FALLBACK_SPEED_KPH)
         G = ox.add_edge_travel_times(G)
 
-        # Determine the projected CRS used by OSMnx
-        nodes_gdf = ox.graph_to_gdfs(G, nodes=True, edges=False)
-        gdf_nodes = nodes_gdf[0] if isinstance(nodes_gdf, tuple) else nodes_gdf
-        crs_proj = gdf_nodes.crs
+        route = self._route_through_waypoints(G, waypoints)
+        poly = self._route_polyline(G, route)
 
-        logger.info("Snapping endpoints and computing shortest path (weight=%s)...", self.weight)
-        n_orig = self._nearest_node(G, crs_proj, origin)
-        n_dest = self._nearest_node(G, crs_proj, destination)
+        routed_s = float(poly.duration_s.sum())
+        if arrive is None:
+            scale = 1.0
+            arrive = (depart + pd.to_timedelta(routed_s, unit="s")).round("s")
+        else:
+            scale = (arrive - depart).total_seconds() / routed_s
+            lo, hi = self._TIMING_SCALE_WARN
+            if not lo <= scale <= hi:
+                logger.warning(
+                    "Your trip duration is %.2fx the OSM estimate (%.0f min). "
+                    "Check the times or the route.", scale, routed_s / 60.0,
+                )
 
-        try:
-            route = nx.shortest_path(G, n_orig, n_dest, weight=self.weight)
-        except nx.NetworkXNoPath as exc:
-            raise RuntimeError(
-                "No drivable path found between origin and destination. "
-                "Try increasing corridor_buffer_m or adjusting waypoints."
-            ) from exc
-
-        gdf_edges = ox.routing.route_to_gdf(G, route)
+        df = self._compute_segments(poly, depart, scale)
+        summary = self._summarize(df, places, depart, arrive, routed_s, scale)
 
         if save_html_map:
-            logger.info("Saving route map to %s ...", html_path)
-            self.save_route_map_html(
-                gdf_edges=gdf_edges,
-                origin_latlon=origin,
-                dest_latlon=destination,
-                vias_latlon=vias,
-                out_html=html_path,
-                zoom_start=zoom_start,
+            summary["route_map_html"] = self.save_route_map_html(
+                df, places, out_html=html_path, zoom_start=zoom_start
             )
 
-        logger.info("Sampling route geometry at %.0f m steps...", self.step_m)
-        route_ls_proj = self._build_route_linestring_projected(gdf_edges)
-        pts_proj, cum_m, total_m = self._sample_linestring_by_step_m(route_ls_proj, self.step_m)
-        pts_ll = gpd.GeoSeries(pts_proj, crs=crs_proj).to_crs("EPSG:4326")
-
-        logger.info("Computing solar positions for %d samples...", len(pts_proj))
-        df = self._compute_segment_results(
-            pts_proj=pts_proj,
-            pts_ll=pts_ll,
-            cum_m=cum_m,
-            total_m=total_m,
-            depart_time=depart,
-            arrive_time=arrive,
-        )
-
-        summary = self._summarize(
-            df=df,
-            total_m=total_m,
-            depart_time=depart,
-            arrive_time=arrive,
-            save_html_map=save_html_map,
-            html_path=html_path,
-        )
-
-        logger.info("Analysis complete: %d segments, total %.1f km.", len(df), total_m / 1000.0)
+        logger.info("Done: %d segments, %.1f km.", len(df), summary["total_distance_m"] / 1000.0)
         return df, summary
 
-    def municipality_from_geopy(
-        self, coordinate: LatLonLike, language: str = "pt-BR"
-    ) -> str | None:
-        """Online reverse-geocode a municipality/city name.
-
-        This makes a network request to Nominatim. Returns None on failure
-        or when no municipality-like field is present in the address.
-        """
+    def municipality_from_geopy(self, coordinate: LatLonLike, language: str | None = None) -> str | None:
+        """Reverse-geocode a municipality name (network request). Returns None on failure."""
         coord = self._coerce_latlon(coordinate, "coordinate")
         for zoom in self._DEFAULT_GEOCODER_ZOOM_LEVELS:
             try:
                 loc = self._reverse(
-                    (coord.lat, coord.lon),
-                    exactly_one=True,
-                    language=language,
-                    zoom=zoom,
-                    addressdetails=True,
+                    (coord.lat, coord.lon), exactly_one=True,
+                    language=language or self.geocoder_language, zoom=zoom, addressdetails=True,
                 )
-            except Exception as exc:  # geopy can raise many transient errors
-                logger.debug("Reverse-geocoding failed at zoom=%d: %s", zoom, exc)
+            except GeopyError as exc:
+                logger.debug("Reverse geocoding failed at zoom=%d: %s", zoom, exc)
                 continue
             if not loc:
                 continue
@@ -276,462 +273,448 @@ class SunSideRouteAnalyzer:
 
     def save_route_map_html(
         self,
-        gdf_edges: gpd.GeoDataFrame,
-        origin_latlon: LatLonLike,
-        dest_latlon: LatLonLike,
-        vias_latlon: list[LatLonLike] | None = None,
+        df: pd.DataFrame,
+        places: list[ResolvedPlace],
         out_html: str | Path = "route.html",
         zoom_start: int = 9,
     ) -> str:
-        """Render and save an interactive Folium map of the computed route."""
-        origin = self._coerce_latlon(origin_latlon, "origin")
-        destination = self._coerce_latlon(dest_latlon, "destination")
-        vias = [self._coerce_latlon(v, f"via[{i}]") for i, v in enumerate(vias_latlon or [])]
+        """Folium map with the route colored by the recommended (shadier) side per stretch."""
+        colors = {"left": "#1f77b4", "right": "#ff7f0e", "none": "#7f7f7f"}
+        labels = {"left": "sit left", "right": "sit right", "none": "no direct sun"}
 
-        edges_ll = (
-            gdf_edges.to_crs("EPSG:4326")
-            if gdf_edges.crs and gdf_edges.crs.to_string() != "EPSG:4326"
-            else gdf_edges
-        )
+        lats = [p.coord.lat for p in places]
+        lons = [p.coord.lon for p in places]
+        m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=zoom_start)
 
-        center = [(origin.lat + destination.lat) / 2.0, (origin.lon + destination.lon) / 2.0]
-        m = folium.Map(location=center, zoom_start=zoom_start)
-
-        folium.GeoJson(edges_ll.geometry.__geo_interface__, name="route").add_to(m)
-        folium.Marker([origin.lat, origin.lon], tooltip="Origin",
-                      icon=folium.Icon(color="green")).add_to(m)
-        folium.Marker([destination.lat, destination.lon], tooltip="Destination",
-                      icon=folium.Icon(color="red")).add_to(m)
-
-        for i, via in enumerate(vias, start=1):
-            folium.CircleMarker(
-                [via.lat, via.lon], radius=5, tooltip=f"Via {i}", fill=True
+        # Group consecutive segments with the same side into one polyline.
+        run_id = (df["side_less_sun"] != df["side_less_sun"].shift()).cumsum()
+        for _, run in df.groupby(run_id, sort=False):
+            side = run["side_less_sun"].iloc[0]
+            pts = list(zip(run["lat1"], run["lon1"])) + [(run["lat2"].iloc[-1], run["lon2"].iloc[-1])]
+            folium.PolyLine(
+                pts, color=colors[side], weight=5, opacity=0.85,
+                tooltip=f"{labels[side]} | {run['time'].iloc[0]:%H:%M}",
             ).add_to(m)
 
-        folium.LayerControl().add_to(m)
+        folium.Marker([lats[0], lons[0]], tooltip=f"Origin: {places[0].label}",
+                      icon=folium.Icon(color="green")).add_to(m)
+        folium.Marker([lats[-1], lons[-1]], tooltip=f"Destination: {places[-1].label}",
+                      icon=folium.Icon(color="red")).add_to(m)
+        for i, p in enumerate(places[1:-1], start=1):
+            folium.CircleMarker([p.coord.lat, p.coord.lon], radius=6, fill=True,
+                                tooltip=f"Via {i}: {p.label}").add_to(m)
+
+        legend = (
+            '<div style="position:fixed;bottom:24px;left:24px;z-index:9999;background:white;'
+            'padding:8px 12px;border-radius:6px;font:13px sans-serif;box-shadow:0 1px 4px #0004">'
+            + "<br>".join(f'<span style="color:{colors[k]}">&#9632;</span> {labels[k]}' for k in colors)
+            + "</div>"
+        )
+        m.get_root().html.add_child(folium.Element(legend))
+
         out_html = str(out_html)
         m.save(out_html)
         return out_html
 
     # -------------------------------------------------------------------------
-    # Validation and coercion
+    # Geocoding, validation, time handling
     # -------------------------------------------------------------------------
+
+    def _geocode_name(self, query: str, name: str) -> ResolvedPlace:
+        key = query.strip().lower()
+        if key in self._geocode_cache:
+            return self._geocode_cache[key]
+
+        try:
+            results = self._geocode(
+                query, exactly_one=False, limit=5,
+                addressdetails=True, language=self.geocoder_language,
+            )
+        except GeopyError as exc:
+            raise RuntimeError(f"Geocoding failed for {name} {query!r}: {exc}") from exc
+        if not results:
+            raise ValueError(f"No geocoding result for {name} {query!r}. Try 'City, State, Country'.")
+
+        best = next(
+            (r for r in results
+             if r.raw.get("addresstype") in self._SETTLEMENT_TYPES
+             or (r.raw.get("class") == "place" and r.raw.get("type") in self._SETTLEMENT_TYPES)),
+            None,
+        )
+        if best is None:
+            best = results[0]
+            logger.warning("%s %r did not match a city/town; using %r.", name, query, best.address)
+
+        resolved = ResolvedPlace(
+            query=query,
+            label=best.address,
+            coord=self._coerce_latlon((best.latitude, best.longitude), name),
+        )
+        self._geocode_cache[key] = resolved
+        return resolved
 
     @staticmethod
     def _coerce_latlon(value: LatLonLike | None, name: str) -> LatLon:
-        """Convert tuple/NamedTuple-like inputs into a validated LatLon."""
         if value is None:
             raise ValueError(f"{name} must be provided.")
-        if isinstance(value, LatLon):
-            lat, lon = value.lat, value.lon
-        else:
-            try:
-                lat, lon = value  # type: ignore[misc]
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a (lat, lon) pair.") from exc
-
-        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
-            raise ValueError(f"{name} must contain numeric (lat, lon).")
-        lat_f, lon_f = float(lat), float(lon)
+        try:
+            lat, lon = value  # works for LatLon and plain tuples
+            lat_f, lon_f = float(lat), float(lon)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a numeric (lat, lon) pair.") from exc
         if not (-90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0):
             raise ValueError(f"{name} is out of range: ({lat_f}, {lon_f}).")
         return LatLon(lat_f, lon_f)
 
-    def _validate_inputs(
-        self,
-        origin: LatLon,
-        destination: LatLon,
-        depart_time: TimeLike,
-        arrive_time: TimeLike,
-    ) -> None:
-        """Pure (no-network) validation of the user-supplied parameters."""
-        if depart_time in (None, "") or arrive_time in (None, ""):
-            raise ValueError("Departure and arrival times must be provided.")
-
-        try:
-            depart = pd.Timestamp(depart_time)
-            arrive = pd.Timestamp(arrive_time)
-        except (ValueError, TypeError) as exc:
-            raise ValueError("Invalid datetime format for depart_time or arrive_time.") from exc
-
-        if pd.isna(depart) or pd.isna(arrive):
-            raise ValueError("depart_time and arrive_time must be valid timestamps.")
-        if arrive <= depart:
-            raise ValueError("arrive_time must be later than depart_time.")
-
-        # Geometric sanity check (offline, fast). Replaces fragile city-name comparison.
-        _, _, dist_m = self.wgs84.inv(
-            origin.lon, origin.lat, destination.lon, destination.lat
-        )
+    def _check_endpoint_distance(self, a: LatLon, b: LatLon) -> None:
+        _, _, dist_m = self.geod.inv(a.lon, a.lat, b.lon, b.lat)
         if dist_m < self._MIN_ENDPOINT_DISTANCE_M:
             raise ValueError(
                 f"Origin and destination are only {dist_m:.0f} m apart "
-                f"(minimum {self._MIN_ENDPOINT_DISTANCE_M:.0f} m). "
-                "Routing is not meaningful at this scale."
+                f"(minimum {self._MIN_ENDPOINT_DISTANCE_M:.0f} m)."
             )
 
+    def _to_tz(self, t: TimeLike, name: str) -> pd.Timestamp:
+        try:
+            ts = pd.Timestamp(t)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid datetime for {name}: {t!r}") from exc
+        if pd.isna(ts):
+            raise ValueError(f"Invalid datetime for {name}: {t!r}")
+        return ts.tz_localize(self.tz) if ts.tzinfo is None else ts.tz_convert(self.tz)
+
     def _normalize_times(
-        self, depart_time: TimeLike, arrive_time: TimeLike
-    ) -> tuple[pd.Timestamp, pd.Timestamp]:
-        """Localize naive timestamps and convert tz-aware ones to the analyzer timezone."""
-        depart = pd.Timestamp(depart_time)
-        arrive = pd.Timestamp(arrive_time)
-
-        depart = depart.tz_localize(self.tz) if depart.tzinfo is None else depart.tz_convert(self.tz)
-        arrive = arrive.tz_localize(self.tz) if arrive.tzinfo is None else arrive.tz_convert(self.tz)
-
+        self, depart_time: TimeLike, arrive_time: TimeLike | None
+    ) -> tuple[pd.Timestamp, pd.Timestamp | None]:
+        depart = self._to_tz(depart_time, "depart_time")
+        if arrive_time in (None, ""):
+            return depart, None
+        arrive = self._to_tz(arrive_time, "arrive_time")
         if arrive <= depart:
             raise ValueError("arrive_time must be later than depart_time.")
         return depart, arrive
 
     # -------------------------------------------------------------------------
-    # Graph and geometry helpers
+    # Graph and routing
     # -------------------------------------------------------------------------
 
     def _build_corridor_graph(self, waypoints: list[LatLon]) -> nx.MultiDiGraph:
-        if len(waypoints) < 2:
-            raise ValueError("Need at least origin and destination to build the corridor graph.")
+        """Download the OSM graph inside a buffer around the waypoint polyline.
 
-        line = LineString([(wp.lon, wp.lat) for wp in waypoints])
-        corridor = (
-            gpd.GeoSeries([line], crs="EPSG:4326")
-            .to_crs(3857)
-            .buffer(self.corridor_buffer_m)
-            .to_crs("EPSG:4326")
-            .iloc[0]
-        )
+        The buffer is computed in the local UTM zone. Web Mercator (EPSG:3857) inflates
+        distances by 1/cos(lat), so a "8 km" buffer there is ~7.4 km true at 21.5°S.
+        """
+        line = gpd.GeoSeries([LineString([(w.lon, w.lat) for w in waypoints])], crs="EPSG:4326")
+        utm = line.estimate_utm_crs()
+        corridor = line.to_crs(utm).buffer(self.corridor_buffer_m).to_crs("EPSG:4326").iloc[0]
         return ox.graph_from_polygon(corridor, network_type=self.network_type)
 
-    def _nearest_node(self, G: nx.MultiDiGraph, crs_proj, latlon: LatLon) -> int:
-        p = (
-            gpd.GeoSeries([Point(latlon.lon, latlon.lat)], crs="EPSG:4326")
-            .to_crs(crs_proj)
-            .iloc[0]
-        )
-        return int(ox.nearest_nodes(G, X=p.x, Y=p.y))
+    def _nearest_node(self, G: nx.MultiDiGraph, p: LatLon) -> tuple[int, float]:
+        """Haversine nearest node on an unprojected graph. Returns (node_id, distance_m)."""
+        ids = np.fromiter(G.nodes, dtype=np.int64, count=G.number_of_nodes())
+        lon = np.radians([G.nodes[n]["x"] for n in ids])
+        lat = np.radians([G.nodes[n]["y"] for n in ids])
+        plat, plon = np.radians(p.lat), np.radians(p.lon)
+        a = np.sin((lat - plat) / 2) ** 2 + np.cos(plat) * np.cos(lat) * np.sin((lon - plon) / 2) ** 2
+        d = 2 * 6_371_008.8 * np.arcsin(np.sqrt(a))
+        k = int(np.argmin(d))
+        return int(ids[k]), float(d[k])
 
-    def _bearing_deg_wgs84(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        fwd_az, _, _ = self.wgs84.inv(lon1, lat1, lon2, lat2)
-        return float((fwd_az + 360.0) % 360.0)
+    def _route_through_waypoints(self, G: nx.MultiDiGraph, waypoints: list[LatLon]) -> list[int]:
+        """Shortest path through every waypoint in order (one leg per consecutive pair)."""
+        nodes = []
+        for i, wp in enumerate(waypoints):
+            n, d = self._nearest_node(G, wp)
+            if d > self._SNAP_WARN_DISTANCE_M:
+                logger.warning("Waypoint %d snapped to a node %.1f km away.", i, d / 1000.0)
+            nodes.append(n)
 
-    @staticmethod
-    def _sun_horizontal_vector_EN(az_deg: float, el_deg: float) -> np.ndarray:
-        """Project the sun direction onto the horizontal plane in (East, North) coordinates.
+        route = [nodes[0]]
+        for leg, (a, b) in enumerate(itertools.pairwise(nodes)):
+            if a == b:
+                continue
+            try:
+                path = nx.shortest_path(G, a, b, weight=self.weight)
+            except nx.NetworkXNoPath as exc:
+                raise RuntimeError(
+                    f"No drivable path for leg {leg}. Increase corridor_buffer_m or add vias."
+                ) from exc
+            route.extend(path[1:])
+        if len(route) < 2:
+            raise RuntimeError("Route collapsed to a single node.")
+        return route
 
-        Returns the zero vector when the sun is below the horizon.
+    def _route_polyline(self, G: nx.MultiDiGraph, route: list[int]) -> _Polyline:
+        """Expand the node route into native OSM vertex-to-vertex segments.
+
+        Each edge geometry is oriented u -> v explicitly. A reversed geometry would flip
+        the heading by 180° and swap left/right on that edge.
+        Edge travel time is split over its sub-segments proportionally to length.
         """
-        if el_deg <= 0.0:
-            return np.array([0.0, 0.0], dtype=float)
-        az = np.deg2rad(az_deg)
-        el = np.deg2rad(el_deg)
-        c = np.cos(el)
-        return np.array([c * np.sin(az), c * np.cos(az)], dtype=float)
-
-    @staticmethod
-    def _build_route_linestring_projected(gdf_edges: gpd.GeoDataFrame) -> LineString:
-        """Concatenate edge geometries into a single continuous LineString."""
-        lines: list[LineString] = []
-        for geom in gdf_edges.geometry:
-            if geom is None:
-                continue
-            if geom.geom_type == "LineString":
-                lines.append(geom)
+        lon1, lat1, lon2, lat2, edge_idx, edge_tt = [], [], [], [], [], []
+        for k, (u, v) in enumerate(itertools.pairwise(route)):
+            data = min(G[u][v].values(), key=lambda d: d.get(self.weight, np.inf))
+            ux, uy = G.nodes[u]["x"], G.nodes[u]["y"]
+            vx, vy = G.nodes[v]["x"], G.nodes[v]["y"]
+            if "geometry" in data:
+                coords = list(data["geometry"].coords)
+                d_first = (coords[0][0] - ux) ** 2 + (coords[0][1] - uy) ** 2
+                d_last = (coords[-1][0] - ux) ** 2 + (coords[-1][1] - uy) ** 2
+                if d_last < d_first:
+                    coords.reverse()
             else:
-                lines.extend(list(geom.geoms))
+                coords = [(ux, uy), (vx, vy)]
+            c = np.asarray(coords, dtype=float)
+            lon1.append(c[:-1, 0]); lat1.append(c[:-1, 1])
+            lon2.append(c[1:, 0]); lat2.append(c[1:, 1])
+            edge_idx.append(np.full(len(c) - 1, k))
+            edge_tt.append(float(data["travel_time"]))
 
-        if not lines:
-            raise RuntimeError("Route has no edge geometries.")
+        lon1, lat1 = np.concatenate(lon1), np.concatenate(lat1)
+        lon2, lat2 = np.concatenate(lon2), np.concatenate(lat2)
+        edge_idx = np.concatenate(edge_idx)
+        edge_tt = np.asarray(edge_tt)
 
-        coords: list[tuple[float, float]] = []
-        for k, ls in enumerate(lines):
-            c = list(ls.coords)
-            if k > 0 and coords and coords[-1] == c[0]:
-                coords.extend(c[1:])
-            else:
-                coords.extend(c)
-        return LineString(coords)
+        az, _, length = self.geod.inv(lon1, lat1, lon2, lat2)
+        keep = length > 0.0
+        lon1, lat1, lon2, lat2 = lon1[keep], lat1[keep], lon2[keep], lat2[keep]
+        az, length, edge_idx = az[keep], length[keep], edge_idx[keep]
 
-    @classmethod
-    def _sample_linestring_by_step_m(
-        cls, ls_proj: LineString, step_m: float
-    ) -> tuple[list[Point], np.ndarray, float]:
-        if step_m <= 0:
-            raise ValueError("step_m must be > 0")
+        edge_len = np.bincount(edge_idx, weights=length, minlength=len(edge_tt))
+        duration = edge_tt[edge_idx] * length / edge_len[edge_idx]
 
-        total = float(ls_proj.length)
-        if not np.isfinite(total) or total <= 0:
-            raise RuntimeError("Invalid route length (check geometries/CRS).")
-
-        n = int(np.floor(total / step_m)) + 1
-        if n > cls._MAX_SAMPLE_POINTS:
-            raise ValueError(
-                f"Sampling would create {n} points (max {cls._MAX_SAMPLE_POINTS}); "
-                "check CRS or increase step_m."
-            )
-        dists = np.linspace(0.0, total, n, dtype=float)
-        pts = [ls_proj.interpolate(d) for d in dists]
-        return pts, dists, total
+        return _Polyline(lon1, lat1, lon2, lat2, length, np.mod(az, 360.0), duration)
 
     # -------------------------------------------------------------------------
-    # Per-segment computation
+    # Solar computation
     # -------------------------------------------------------------------------
 
-    def _compute_segment_results(
-        self,
-        pts_proj: list[Point],
-        pts_ll: gpd.GeoSeries,
-        cum_m: np.ndarray,
-        total_m: float,
-        depart_time: pd.Timestamp,
-        arrive_time: pd.Timestamp,
-    ) -> pd.DataFrame:
-        """For each segment, compute solar geometry and the recommended shadier side."""
-        total_dt_s = (arrive_time - depart_time).total_seconds()
-        results: list[SegmentResult] = []
+    def _compute_segments(self, poly: _Polyline, depart: pd.Timestamp, scale: float) -> pd.DataFrame:
+        """Vectorized solar geometry and exposure for every segment, evaluated at its midpoint."""
+        dt_s = poly.duration_s * scale
+        t_mid_s = np.cumsum(dt_s) - dt_s / 2.0
+        times = pd.DatetimeIndex(depart + pd.to_timedelta(t_mid_s, unit="s"))
 
-        for i in range(len(pts_proj) - 1):
-            p1, p2 = pts_proj[i], pts_proj[i + 1]
-            seg_m = float(cum_m[i + 1] - cum_m[i])
-            if seg_m <= 0:
-                continue
+        lat_mid = (poly.lat1 + poly.lat2) / 2.0
+        lon_mid = (poly.lon1 + poly.lon2) / 2.0
 
-            # Linearly interpolate timestamp along the route by cumulative distance
-            frac = float(cum_m[i] / total_m) if total_m > 0 else 0.0
-            t = depart_time + pd.to_timedelta(frac * total_dt_s, unit="s")
+        sol = pvlib.solarposition.get_solarposition(times, lat_mid, lon_mid)
+        el = sol["apparent_elevation"].to_numpy()
+        az = sol["azimuth"].to_numpy()
+        zen = sol["apparent_zenith"].to_numpy()
 
-            # Local direction in projected (metric) CRS
-            dx = float(p2.x - p1.x)
-            dy = float(p2.y - p1.y)
-            norm = (dx * dx + dy * dy) ** 0.5
-            if norm == 0:
-                continue
-            dE, dN = dx / norm, dy / norm
+        dni = self._direct_normal_irradiance(times, zen, lat_mid, lon_mid)
+        up = el > 0.0
+        dni = np.where(up, dni, 0.0)
 
-            # Side normals (left = 90° CCW, right = 90° CW from heading)
-            nL = np.array([-dN, dE], dtype=float)
-            nR = np.array([dN, -dE], dtype=float)
+        # cos(incidence) on the left vertical window; right window is the negative.
+        cos_left = np.where(up, np.cos(np.radians(el)) * np.sin(np.radians(poly.heading_deg - az)), 0.0)
+        exp_left = dni * np.clip(cos_left, 0.0, None) * dt_s / 3600.0
+        exp_right = dni * np.clip(-cos_left, 0.0, None) * dt_s / 3600.0
 
-            lon = float(pts_ll.iloc[i].x)
-            lat = float(pts_ll.iloc[i].y)
+        side = np.where(
+            (dni <= 0.0) | (cos_left == 0.0), "none",
+            np.where(cos_left > 0.0, "right", "left"),   # sun on the left -> sit right
+        )
 
-            solpos = pvlib.solarposition.get_solarposition(t, lat, lon)
-            az = float(solpos["azimuth"].iloc[0])
-            el = float(solpos["elevation"].iloc[0])
-            svec = self._sun_horizontal_vector_EN(az, el)
+        return pd.DataFrame({
+            "time": times,
+            "lat1": poly.lat1, "lon1": poly.lon1,
+            "lat2": poly.lat2, "lon2": poly.lon2,
+            "length_m": poly.length_m,
+            "cum_m": np.cumsum(poly.length_m),
+            "duration_s": dt_s,
+            "heading_deg": poly.heading_deg,
+            "sun_azimuth_deg": az,
+            "sun_elevation_deg": el,
+            "dni_w_m2": dni,
+            "cos_incidence_left": cos_left,
+            "exposure_left_wh_m2": exp_left,
+            "exposure_right_wh_m2": exp_right,
+            "side_less_sun": side,
+        })
 
-            I_left = float(np.dot(svec, nL))
-            I_right = float(np.dot(svec, nR))
+    def _direct_normal_irradiance(
+        self, times: pd.DatetimeIndex, apparent_zenith: np.ndarray,
+        lat: np.ndarray, lon: np.ndarray,
+    ) -> np.ndarray:
+        """Clear-sky DNI (Ineichen-Perez) or a constant 1.0 in geometric mode.
 
-            # Effective irradiance is non-negative (a side cannot receive negative sun)
-            effL = max(0.0, I_left)
-            effR = max(0.0, I_right)
+        Linke turbidity is looked up once at the route centroid. Its spatial resolution
+        (1/12°) makes per-segment lookup unnecessary for regional routes.
+        """
+        if self.weighting == "geometric":
+            return np.ones(len(times))
 
-            if el <= 0.0 or (effL == 0.0 and effR == 0.0):
-                side = "none"
-            else:
-                side = "left" if effL < effR else "right"
-
-            # Reporting bearing computed in geographic (WGS84) coordinates
-            if i + 1 < len(pts_ll):
-                lat2 = float(pts_ll.iloc[i + 1].y)
-                lon2 = float(pts_ll.iloc[i + 1].x)
-                bearing = self._bearing_deg_wgs84(lat, lon, lat2, lon2)
-            else:
-                bearing = float("nan")
-
-            results.append(
-                SegmentResult(
-                    index=i,
-                    time=t,
-                    lat=lat,
-                    lon=lon,
-                    segment_m=seg_m,
-                    cum_m=float(cum_m[i]),
-                    road_bearing_deg=bearing,
-                    sun_azimuth_deg=az,
-                    sun_elevation_deg=el,
-                    I_left=I_left,
-                    I_right=I_right,
-                    side_less_sun=side,
-                )
-            )
-
-        return pd.DataFrame([asdict(r) for r in results])
+        am_rel = pvlib.atmosphere.get_relative_airmass(apparent_zenith)
+        am_abs = pvlib.atmosphere.get_absolute_airmass(am_rel)
+        try:
+            tl = pvlib.clearsky.lookup_linke_turbidity(
+                times, float(np.mean(lat)), float(np.mean(lon))
+            ).to_numpy()
+        except Exception as exc:  # missing h5py or data file
+            logger.warning("Linke turbidity lookup failed (%s); using TL=3.0.", exc)
+            tl = np.full(len(times), 3.0)
+        dni_extra = pvlib.irradiance.get_extra_radiation(times).to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):  # sun below horizon -> NaN, zeroed below
+            cs = pvlib.clearsky.ineichen(apparent_zenith, am_abs, tl, dni_extra=dni_extra)
+        return np.nan_to_num(np.asarray(cs["dni"], dtype=float), nan=0.0)
 
     def _summarize(
         self,
         df: pd.DataFrame,
-        total_m: float,
-        depart_time: pd.Timestamp,
-        arrive_time: pd.Timestamp,
-        save_html_map: bool,
-        html_path: str,
-    ) -> dict[str, float | int | str]:
-        """Compute distance-weighted aggregates over all segments."""
-        base_summary: dict[str, float | int | str] = {
-            "total_distance_m": float(total_m),
-            "segments": int(len(df)),
-            "step_m": float(self.step_m),
-            "depart_time": str(depart_time),
-            "arrive_time": str(arrive_time),
-            "corridor_buffer_m": float(self.corridor_buffer_m),
-            "route_map_html": html_path if save_html_map else "",
-        }
+        places: list[ResolvedPlace],
+        depart: pd.Timestamp,
+        arrive: pd.Timestamp,
+        routed_s: float,
+        scale: float,
+    ) -> dict[str, object]:
+        L = float(df["exposure_left_wh_m2"].sum())
+        R = float(df["exposure_right_wh_m2"].sum())
+        total_t = float(df["duration_s"].sum())
 
-        if df.empty:
-            base_summary["overall_best_side"] = "none"
-            return base_summary
-
-        df = df.assign(
-            eff_left=df["I_left"].clip(lower=0.0),
-            eff_right=df["I_right"].clip(lower=0.0),
-            w=df["segment_m"],
-        )
-        wsum = float(df["w"].sum())
-
-        avg_eff_left = float((df["eff_left"] * df["w"]).sum() / wsum) if wsum > 0 else 0.0
-        avg_eff_right = float((df["eff_right"] * df["w"]).sum() / wsum) if wsum > 0 else 0.0
-
-        share_left = float(df.loc[df["side_less_sun"] == "left", "w"].sum() / wsum) if wsum > 0 else 0.0
-        share_right = float(df.loc[df["side_less_sun"] == "right", "w"].sum() / wsum) if wsum > 0 else 0.0
-        share_none = float(df.loc[df["side_less_sun"] == "none", "w"].sum() / wsum) if wsum > 0 else 0.0
-
-        if avg_eff_left > 0.0 or avg_eff_right > 0.0:
-            overall = "left" if avg_eff_left < avg_eff_right else "right"
-        else:
+        # balance > 0: right window gets more sun -> sit left.
+        balance = (R - L) / (R + L) if (R + L) > 0 else 0.0
+        if R + L == 0:
             overall = "none"
+        elif abs(balance) < self.balance_threshold:
+            overall = "either"
+        else:
+            overall = "left" if balance > 0 else "right"
 
-        base_summary.update({
-            "avg_effective_incidence_left": avg_eff_left,
-            "avg_effective_incidence_right": avg_eff_right,
-            "distance_share_less_sun_left": share_left,
-            "distance_share_less_sun_right": share_right,
-            "distance_share_no_direct_sun": share_none,
+        def tshare(s: str) -> float:
+            return float(df.loc[df["side_less_sun"] == s, "duration_s"].sum() / total_t)
+
+        return {
+            "origin": places[0].label,
+            "destination": places[-1].label,
+            "vias": [p.label for p in places[1:-1]],
+            "total_distance_m": float(df["length_m"].sum()),
+            "segments": int(len(df)),
+            "depart_time": str(depart),
+            "arrive_time": str(arrive),
+            "osm_duration_min": routed_s / 60.0,
+            "timing_scale": scale,
+            "corridor_buffer_m": self.corridor_buffer_m,
+            "weighting": self.weighting,
+            "exposure_left_wh_m2": L,
+            "exposure_right_wh_m2": R,
+            "balance": balance,
+            "time_share_sit_left": tshare("left"),
+            "time_share_sit_right": tshare("right"),
+            "time_share_no_direct_sun": tshare("none"),
             "overall_best_side": overall,
-        })
-        return base_summary
+            "route_map_html": "",
+        }
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
 # CLI
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#
 
-def _parse_latlon(text: str) -> LatLon:
-    """Parse a 'lat,lon' string into a LatLon."""
-    try:
-        lat_str, lon_str = text.split(",")
-        return LatLon(float(lat_str.strip()), float(lon_str.strip()))
-    except (ValueError, AttributeError) as exc:
-        raise argparse.ArgumentTypeError(
-            f"Invalid coordinate '{text}'. Expected format: 'lat,lon' (e.g. '-21.36,-42.48')."
-        ) from exc
-
-
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Estimate which vehicle side receives less sunlight along a driving route.",
+        description="Estimate which vehicle side receives less direct sunlight along a driving route.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--origin", type=_parse_latlon, required=True,
-                        help="Origin coordinate as 'lat,lon'.")
-    parser.add_argument("--destination", type=_parse_latlon, required=True,
-                        help="Destination coordinate as 'lat,lon'.")
-    parser.add_argument("--depart", required=True,
-                        help="Departure time (ISO 8601, e.g. '2026-02-15 14:30').")
-    parser.add_argument("--arrive", required=True,
-                        help="Arrival time (ISO 8601, e.g. '2026-02-15 17:00').")
-    parser.add_argument("--via", type=_parse_latlon, action="append", default=[],
-                        help="Intermediate waypoint as 'lat,lon'. Repeat for multiple vias.")
-    parser.add_argument("--tz", default="America/Sao_Paulo",
-                        help="Timezone for naive timestamps.")
+    place_help = "City name ('Juiz de Fora, MG, Brasil') or 'lat,lon'."
+    parser.add_argument("--origin", required=True, help=place_help)
+    parser.add_argument("--destination", required=True, help=place_help)
+    parser.add_argument("--via", action="append", default=[], help=place_help + " Repeatable.")
+    parser.add_argument("--depart", required=True, help="Departure time, e.g. '2026-02-15 14:30'.")
+    parser.add_argument("--arrive", default=None,
+                        help="Arrival time. If omitted, OSM travel-time estimate is used.")
+    parser.add_argument("--tz", default="America/Sao_Paulo", help="Timezone for naive timestamps.")
     parser.add_argument("--corridor-buffer-m", type=float, default=8000.0,
-                        help="Corridor buffer width in meters around the path.")
-    parser.add_argument("--step-m", type=float, default=500.0,
-                        help="Sampling step in meters along the route.")
-    parser.add_argument("--weight", default="travel_time",
-                        choices=["travel_time", "length"],
-                        help="Edge weight used by the shortest-path algorithm.")
-    parser.add_argument("--html-out", default="route.html",
-                        help="Output path for the interactive HTML map.")
-    parser.add_argument("--csv-out", default=None,
-                        help="If set, save the per-segment DataFrame as CSV at this path.")
-    parser.add_argument("--no-map", action="store_true",
-                        help="Skip rendering the HTML map.")
-    parser.add_argument("--show-head", action="store_true",
-                        help="Print the first rows of the segments DataFrame.")
-    parser.add_argument("--lookup-cities", action="store_true",
-                        help="Reverse-geocode origin/destination cities (requires network).")
-    parser.add_argument("-v", "--verbose", action="count", default=0,
-                        help="Increase logging verbosity (-v, -vv).")
+                        help="Corridor buffer on each side of the waypoint polyline (m).")
+    parser.add_argument("--weight", default="travel_time", choices=["travel_time", "length"],
+                        help="Edge weight for the router.")
+    parser.add_argument("--weighting", default="clearsky", choices=["clearsky", "geometric"],
+                        help="Weight incidence by clear-sky DNI, or use pure geometry.")
+    parser.add_argument("--balance-threshold", type=float, default=0.15,
+                        help="Below this |balance| the result is 'either'.")
+    parser.add_argument("--html-out", default="route.html", help="Output HTML map path.")
+    parser.add_argument("--csv-out", default=None, help="Optional per-segment CSV path.")
+    parser.add_argument("--no-map", action="store_true", help="Skip the HTML map.")
+    parser.add_argument("--show-head", action="store_true", help="Print the first segment rows.")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="-v INFO, -vv DEBUG.")
     return parser
 
 
+_PLACE_FLAGS = ("--origin", "--destination", "--via")
+
+
+def _glue_negative_coords(argv: list[str]) -> list[str]:
+    """Rewrite '--origin -21.7,-43.0' as '--origin=-21.7,-43.0'.
+
+    argparse treats any token starting with '-' as an option unless it matches its
+    negative-number pattern. 'lat,lon' with a comma never matches, so southern or
+    western coordinates would otherwise fail with 'expected one argument'.
+    """
+    out: list[str] = []
+    it = iter(range(len(argv)))
+    for i in it:
+        tok = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if tok in _PLACE_FLAGS and nxt is not None and _LATLON_RE.match(nxt):
+            out.append(f"{tok}={nxt}")
+            next(it, None)
+        else:
+            out.append(tok)
+    return out
+
+
 def _configure_logging(verbosity: int) -> None:
-    level = logging.WARNING
-    if verbosity == 1:
-        level = logging.INFO
-    elif verbosity >= 2:
-        level = logging.DEBUG
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%H:%M:%S")
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point. Returns a process exit code."""
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = _build_arg_parser().parse_args(_glue_negative_coords(argv))
     _configure_logging(args.verbose)
 
     analyzer = SunSideRouteAnalyzer(
         tz=args.tz,
-        network_type="drive",
         weight=args.weight,
         corridor_buffer_m=args.corridor_buffer_m,
-        step_m=args.step_m,
+        weighting=args.weighting,
+        balance_threshold=args.balance_threshold,
     )
-
     try:
-        df, summary = analyzer.analyze(
-            origin_latlon=args.origin,
-            dest_latlon=args.destination,
-            via_latlon=args.via,
-            depart_time=args.depart,
-            arrive_time=args.arrive,
-            save_html_map=not args.no_map,
-            html_path=args.html_out,
+        df, s = analyzer.analyze(
+            origin=args.origin, destination=args.destination, vias=args.via,
+            depart_time=args.depart, arrive_time=args.arrive,
+            save_html_map=not args.no_map, html_path=args.html_out,
         )
     except (ValueError, RuntimeError) as exc:
         logger.error("Analysis failed: %s", exc)
         return 1
 
-    # Optional CSV export
     if args.csv_out:
-        out_path = Path(args.csv_out)
-        df.to_csv(out_path, index=False)
-        logger.info("Saved %d segments to %s", len(df), out_path)
+        df.to_csv(Path(args.csv_out), index=False)
 
-    # Optional reverse geocoding (network)
-    origin_label, dest_label = "origin", "destination"
-    if args.lookup_cities:
-        origin_label = analyzer.municipality_from_geopy(args.origin) or origin_label
-        dest_label = analyzer.municipality_from_geopy(args.destination) or dest_label
+    verdict = {
+        "none": "no direct sun on the side windows",
+        "either": "both sides get similar sun; no clear winner",
+        "left": "sit on the LEFT side",
+        "right": "sit on the RIGHT side",
+    }[s["overall_best_side"]]
 
-    overall = summary.get("overall_best_side", "none")
-    overall_human = "no significant sunlight" if overall == "none" else f"keep your seat on the {overall} side"
-
-    print(f"From {origin_label} to {dest_label}, departing {args.depart}")
-    print(f"Total distance: {summary['total_distance_m'] / 1000.0:.1f} km in {summary['segments']} segments")
-    print(f"Recommendation: {overall_human}")
-    if summary.get("route_map_html"):
-        print(f"Route map: {summary['route_map_html']}")
-
+    print(f"From:    {s['origin']}")
+    print(f"To:      {s['destination']}")
+    print(f"Window:  {s['depart_time']} -> {s['arrive_time']} "
+          f"(OSM estimate {s['osm_duration_min']:.0f} min, scale {s['timing_scale']:.2f})")
+    print(f"Route:   {s['total_distance_m'] / 1000:.1f} km, {s['segments']} segments")
+    unit = "Wh/m²" if s["weighting"] == "clearsky" else "unitless"
+    print(f"Exposure left/right: {s['exposure_left_wh_m2']:.0f} / {s['exposure_right_wh_m2']:.0f} {unit}"
+          f"  (balance {s['balance']:+.2f})")
+    print(f"Recommendation: {verdict}")
+    if s["route_map_html"]:
+        print(f"Map: {s['route_map_html']}")
     if args.show_head and not df.empty:
-        print()
-        print(df.head().to_string(index=False))
-
+        print("\n" + df.head().to_string(index=False))
     return 0
 
 
